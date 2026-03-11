@@ -1,9 +1,9 @@
 """
-Gesture Sampler — Hand & face gesture-triggered drum machine.
-Two windows: camera + sampler panel.
-MIDI output to connect any DAW/sampler.
+Gesture Controller — Hand & face gesture tracking → Ableton via OSC + MIDI.
+Camera window + control panel. All audio handled in Ableton.
 """
 import os
+import sys
 import time
 import threading
 
@@ -17,11 +17,10 @@ from mediapipe.tasks.python.vision import (
     RunningMode,
 )
 
-from sampler import Sampler
-from ui import SamplerUI
+from PyQt6.QtWidgets import QApplication
+from panel import SamplerPanel
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SAMPLES_DIR = os.path.join(SCRIPT_DIR, "samples")
 HAND_MODEL = os.path.join(SCRIPT_DIR, "hand_landmarker.task")
 FACE_MODEL = os.path.join(SCRIPT_DIR, "face_landmarker.task")
 
@@ -40,7 +39,6 @@ COLORS = {
     "mouth_open": (0, 140, 255), "left_eyebrow": (100, 255, 100),
     "right_eyebrow": (100, 100, 255), "unknown": (100, 100, 100),
 }
-DEFAULT_SAMPLES = ["kick", "snare", "hihat", "tom", "clap", "cowbell", "rimshot", "cymbal"]
 
 HAND_CONN = [
     (0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
@@ -79,16 +77,9 @@ class Cal:
         self.finger_margin = sorted(diffs)[1]
         self.hand_calibrated = True
 
-    def mouth_thresh(self):
-        return (self.neutral_mouth * 2.0) if self.neutral_mouth else 0.04
-    def left_brow_thresh(self):
-        return (self.neutral_lb * 1.4) if self.neutral_lb else 0.025
-    def right_brow_thresh(self):
-        return (self.neutral_rb * 1.4) if self.neutral_rb else 0.025
-
 
 def run_calibration(cap, hlm, flm, cal, start_ts=9000):
-    CAM_WIN = "Gesture Sampler"
+    CAM_WIN = "Gesture Controller"
     t0 = time.time()
     cd, dur = 2.0, 3.0
     ts = [start_ts]
@@ -162,62 +153,36 @@ def run_calibration(cap, hlm, flm, cal, start_ts=9000):
     return True, ts[0]
 
 
-class Clock:
-    def __init__(self, sampler, bpm=120, subdiv=4):
-        self.bpm = bpm
-        self.subdivision = subdiv
-        self.enabled = True
-        self.sampler = sampler
-        self._pending = []
-        self._loops = {}
-        self._lock = threading.Lock()
-        self._running = True
-        self._beat_flash = 0.0
-        self._beat_count = 0
-        self._last = time.time()
-        threading.Thread(target=self._run, daemon=True).start()
+def _lm_to_array(lm):
+    return np.array([(l.x, l.y, l.z) for l in lm], dtype=np.float32)
 
-    @property
-    def tick_interval(self):
-        return (60.0 / self.bpm) / self.subdivision
 
-    def queue_sound(self, k, sn, v=1.0):
-        with self._lock:
-            if not any(x[0] == k for x in self._pending):
-                self._pending.append((k, sn, v))
+def _normalize_landmarks(arr):
+    wrist = arr[0].copy()
+    norm = arr - wrist
+    scale = np.linalg.norm(norm[9]) if np.linalg.norm(norm[9]) > 0.001 else 1.0
+    return norm / scale
 
-    def start_loop(self, k, sn, v=1.0):
-        with self._lock: self._loops[k] = (sn, v)
-    def stop_loop(self, k):
-        with self._lock: self._loops.pop(k, None)
-    def stop_all_loops(self):
-        with self._lock: self._loops.clear()
-    def get_active_loops(self):
-        with self._lock: return dict(self._loops)
 
-    @property
-    def is_on_beat(self):
-        return (time.time() - self._beat_flash) < 0.07
-
-    def _run(self):
-        while self._running:
-            iv = self.tick_interval
-            sl = iv - ((time.time() - self._last) % iv)
-            time.sleep(sl)
-            self._last = time.time()
-            self._beat_flash = self._last
-            self._beat_count += 1
-            with self._lock:
-                play = [(s, v) for _, s, v in self._pending]
-                self._pending.clear()
-                play += list(self._loops.values())
-            for s, v in play:
-                self.sampler.play(s, v)
-
-    def stop(self): self._running = False
+def match_custom_gesture(lm, captured_gestures, threshold=0.35):
+    if not captured_gestures:
+        return None
+    current = _normalize_landmarks(_lm_to_array(lm))
+    best_name, best_dist = None, threshold
+    for name, ref_arr in captured_gestures.items():
+        dist = np.mean(np.linalg.norm(current - ref_arr, axis=1))
+        if dist < best_dist:
+            best_dist = dist
+            best_name = name
+    return best_name
 
 
 def classify_hand(lm, label, cal, ui=None):
+    if ui and ui.captured_gestures:
+        custom = match_custom_gesture(lm, ui.captured_gestures)
+        if custom:
+            return custom
+
     m = ui.hand_margin if ui else (cal.finger_margin if cal.hand_calibrated else 0.0)
     def up(t, p): return (lm[p].y - lm[t].y) > m
     tt, ti, tm_ = lm[4], lm[3], lm[2]
@@ -279,30 +244,12 @@ def draw_face(f, lm, active, h, w):
 
 
 def main():
-    sampler = Sampler(max_voices=16, buffer_size=256)
+    app = QApplication(sys.argv)
 
-    os.makedirs(SAMPLES_DIR, exist_ok=True)
-    existing = {os.path.splitext(f)[0] for f in os.listdir(SAMPLES_DIR)}
-    missing = set(DEFAULT_SAMPLES) - existing
-    if missing:
-        import generate_samples
-        for n in missing:
-            if n in generate_samples.ALL_GENERATORS:
-                generate_samples.ALL_GENERATORS[n]()
-
-    loaded = sampler.load_directory(SAMPLES_DIR)
-    print(f"Loaded {len(loaded)} samples: {loaded}")
-
-    mapping = {}
-    for i, g in enumerate(ALL_GESTURES):
-        mapping[g] = DEFAULT_SAMPLES[i] if i < len(DEFAULT_SAMPLES) else "none"
     modes = {g: "shot" for g in ALL_GESTURES}
-
     cal = Cal()
-    clock = Clock(sampler, bpm=120, subdiv=4)
 
-    ui = SamplerUI(ALL_GESTURES, LABELS, COLORS, mapping, modes,
-                   sampler, clock, cal, FACE_GESTURES)
+    ui = SamplerPanel(ALL_GESTURES, LABELS, COLORS, modes, cal, FACE_GESTURES)
 
     # MediaPipe
     hs, fs = {"d": None}, {"d": None}
@@ -326,20 +273,23 @@ def main():
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("ERROR: Cannot open camera."); return
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
 
-    CAM_WIN = "Gesture Sampler"
+    CAM_WIN = "Gesture Controller"
     cv2.namedWindow(CAM_WIN, cv2.WINDOW_AUTOSIZE)
 
-    # No startup calibration — manual thresholds
     fts = 9000
+    t0_ms = int(time.time() * 1000)
 
-    last_trig = {}
-    cooldown = 0.3
     prev_hand, prev_face = set(), set()
+    gate_release_timers = {}  # gk → time when gesture left, for debouncing
+    GATE_DEBOUNCE = 0.15  # seconds — ignore flickers shorter than this
+    last_ui_draw = 0.0
+    UI_INTERVAL = 1.0 / 15
 
-    print("Running! Press 'q' to quit. Use TUNE mode to adjust thresholds.")
+    print("Running! Press 'q' to quit.")
 
     while True:
         ret, frame = cap.read()
@@ -349,12 +299,25 @@ def main():
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mi = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        fts += 33
+        fts = int(time.time() * 1000) - t0_ms + 10000
         hlm.detect_async(mi, fts)
         if ui.face_enabled:
             flm.detect_async(mi, fts)
 
         now = time.time()
+
+        # --- Gesture Capture ---
+        if ui.capture_mode:
+            elapsed = now - ui.capture_countdown
+            with hl: hr_cap = hs["d"]
+            if elapsed >= 3.0 and hr_cap and hr_cap.hand_landmarks:
+                cap_lm = hr_cap.hand_landmarks[0]
+                arr = _normalize_landmarks(_lm_to_array(cap_lm))
+                slot_idx = ui.capture_slot
+                g = ui.gestures[slot_idx]
+                ui.captured_gestures[g] = arr
+                ui.capture_mode = False
+                print(f"Captured gesture for slot {slot_idx + 1} ({g})")
 
         # --- Hands ---
         cur_h = set()
@@ -369,32 +332,61 @@ def main():
                 draw_hand(frame, hls, col, fh, fw)
 
                 wx, wy = int(hls[0].x*fw), int(hls[0].y*fh)
-                sn = mapping.get(g, "none")
                 mode = modes.get(g, "shot")
-                txt = LABELS.get(g, g).upper()
-                if sn != "none": txt += f" [{sn}]"
-                cv2.putText(frame, txt, (wx-60, wy-30),
+                cv2.putText(frame, LABELS.get(g, g).upper(), (wx-60, wy-30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.65, col, 2)
 
                 gk = f"hand_{lab}_{g}"
-                if g != "unknown" and sn != "none" and sn in sampler.samples:
+                if g != "unknown":
                     cur_h.add(gk)
-                    if mode == "loop":
-                        if gk not in prev_hand:
-                            clock.start_loop(gk, sn)
-                            ui.trigger_times[g] = now
-                    else:
-                        lt = last_trig.get(gk, 0)
-                        if now - lt > cooldown:
-                            if clock.enabled:
-                                clock.queue_sound(gk, sn)
-                            else:
-                                sampler.play(sn)
-                            last_trig[gk] = now
+                    onset = gk not in prev_hand
+
+                    if mode == "shot":
+                        if onset:
+                            ui.osc_fire(g)
+                            ui.midi_fire(g)
                             ui.trigger_times[g] = now
                             cv2.circle(frame, (wx, wy-50), 12, col, -1)
+                    elif mode == "gate":
+                        if onset:
+                            ui.osc_fire(g)
+                            ui.midi_fire(g)
+                            ui.trigger_times[g] = now
+                            cv2.circle(frame, (wx, wy-50), 12, col, -1)
+                    elif mode == "toggle":
+                        if onset:
+                            playing = ui.toggle_states.get(gk, False)
+                            if playing:
+                                ui.osc_stop(g)
+                                ui.midi_stop(g)
+                                ui.toggle_states[gk] = False
+                            else:
+                                ui.osc_fire(g)
+                                ui.midi_fire(g)
+                                ui.toggle_states[gk] = True
+                                ui.trigger_times[g] = now
+                                cv2.circle(frame, (wx, wy-50), 12, col, -1)
+                    elif mode == "loop":
+                        if onset:
+                            ui.osc_fire(g)
+                            ui.midi_fire(g)
+                            ui.trigger_times[g] = now
 
-        for gk in prev_hand - cur_h: clock.stop_loop(gk)
+        # Gate: debounced stop on release
+        for gk in prev_hand - cur_h:
+            g_name = gk.split("_", 2)[-1]
+            if modes.get(g_name, "shot") == "gate" and gk not in gate_release_timers:
+                gate_release_timers[gk] = now
+        # Cancel timers for gestures that came back
+        for gk in cur_h:
+            gate_release_timers.pop(gk, None)
+        # Fire stops for gestures that stayed gone past debounce
+        expired = [gk for gk, t in gate_release_timers.items() if now - t >= GATE_DEBOUNCE]
+        for gk in expired:
+            g_name = gk.split("_", 2)[-1]
+            ui.osc_stop(g_name)
+            ui.midi_stop(g_name)
+            del gate_release_timers[gk]
         prev_hand = cur_h
 
         # --- Face ---
@@ -406,38 +398,81 @@ def main():
                     af = classify_face(fls, cal, ui)
                     draw_face(frame, fls, af, fh, fw)
                     for g in af:
-                        sn = mapping.get(g, "none")
                         mode = modes.get(g, "shot")
                         gk = f"face_{g}"
-                        if sn != "none" and sn in sampler.samples:
-                            cur_f.add(gk)
-                            if mode == "loop":
-                                if gk not in prev_face:
-                                    clock.start_loop(gk, sn)
-                                    ui.trigger_times[g] = now
-                            else:
-                                lt = last_trig.get(gk, 0)
-                                if now - lt > cooldown:
-                                    if clock.enabled:
-                                        clock.queue_sound(gk, sn)
-                                    else:
-                                        sampler.play(sn)
-                                    last_trig[gk] = now
-                                    ui.trigger_times[g] = now
+                        cur_f.add(gk)
+                        onset = gk not in prev_face
 
-        for gk in prev_face - cur_f: clock.stop_loop(gk)
+                        if mode == "shot":
+                            if onset:
+                                ui.osc_fire(g)
+                                ui.midi_fire(g)
+                                ui.trigger_times[g] = now
+                        elif mode == "gate":
+                            if onset:
+                                ui.osc_fire(g)
+                                ui.midi_fire(g)
+                                ui.trigger_times[g] = now
+                        elif mode == "toggle":
+                            if onset:
+                                playing = ui.toggle_states.get(gk, False)
+                                if playing:
+                                    ui.osc_stop(g)
+                                    ui.midi_stop(g)
+                                    ui.toggle_states[gk] = False
+                                else:
+                                    ui.osc_fire(g)
+                                    ui.midi_fire(g)
+                                    ui.toggle_states[gk] = True
+                                    ui.trigger_times[g] = now
+                        elif mode == "loop":
+                            if onset:
+                                ui.osc_fire(g)
+                                ui.midi_fire(g)
+                                ui.trigger_times[g] = now
+
+        # Face gate: debounced stop on release
+        for gk in prev_face - cur_f:
+            g_name = gk.split("_", 1)[-1]
+            if modes.get(g_name, "shot") == "gate" and gk not in gate_release_timers:
+                gate_release_timers[gk] = now
+        for gk in cur_f:
+            gate_release_timers.pop(gk, None)
+        expired_f = [gk for gk, t in gate_release_timers.items()
+                     if gk.startswith("face_") and now - t >= GATE_DEBOUNCE]
+        for gk in expired_f:
+            g_name = gk.split("_", 1)[-1]
+            ui.osc_stop(g_name)
+            ui.midi_stop(g_name)
+            del gate_release_timers[gk]
         prev_face = cur_f
 
-        # --- Show camera ---
+        # --- Capture overlay ---
+        if ui.capture_mode:
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (0, 0), (fw, 50), (0, 0, 80), -1)
+            elapsed_cap = now - ui.capture_countdown
+            slot_label = ui.labels.get(ui.gestures[ui.capture_slot], "?")
+            if elapsed_cap < 3.0:
+                sec = 3 - int(elapsed_cap)
+                cv2.putText(overlay, f"CAPTURE [{slot_label}] in {sec}...",
+                            (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 100, 255), 2)
+            else:
+                cv2.putText(overlay, f"SHOW GESTURE for [{slot_label}]",
+                            (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                t = int(abs(now * 4 % 2 - 1) * 255)
+                cv2.rectangle(overlay, (2, 2), (fw-2, fh-2), (0, 0, t), 3)
+            frame = overlay
+
         cv2.imshow(CAM_WIN, frame)
 
-        # --- Show panel ---
-        ui.show()
+        if now - last_ui_draw >= UI_INTERVAL:
+            ui.update()
+            last_ui_draw = now
 
-        # --- Handle auto-cal request ---
+        # Auto-cal request
         if ui.auto_cal_requested:
             ui.auto_cal_requested = False
-            clock.stop_all_loops()
             prev_hand, prev_face = set(), set()
             ok, fts = run_calibration(cap, hlm, flm, cal, fts + 1000)
             if not ok: break
@@ -449,7 +484,7 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
     hlm.close(); flm.close()
-    clock.stop(); sampler.stop()
+    ui.cleanup()
 
 
 if __name__ == "__main__":
